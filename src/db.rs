@@ -1,0 +1,394 @@
+use anyhow::Result;
+use rusqlite::{params, Connection};
+use std::path::Path;
+
+pub fn open(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    Ok(conn)
+}
+
+pub fn init(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS raw_entries (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            date TEXT NOT NULL,
+            time TEXT NOT NULL,
+            type TEXT NOT NULL,
+            tool_name TEXT,
+            content TEXT NOT NULL,
+            cwd TEXT,
+            git_branch TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_raw_session ON raw_entries(session_id);
+        CREATE INDEX IF NOT EXISTS idx_raw_timestamp ON raw_entries(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_raw_date ON raw_entries(date);
+        CREATE INDEX IF NOT EXISTS idx_raw_type ON raw_entries(type);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS raw_entries_fts USING fts5(
+            content, tool_name, session_id
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_state (
+            file_path TEXT PRIMARY KEY,
+            last_offset INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS summaries (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL UNIQUE,
+            project_path TEXT,
+            git_branch TEXT,
+            started_at TEXT,
+            ended_at TEXT,
+            summary_md TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn reset(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS raw_entries_fts;
+        DROP TABLE IF EXISTS raw_entries;
+        DROP TABLE IF EXISTS sync_state;
+        DROP TABLE IF EXISTS summaries;
+        ",
+    )?;
+    init(conn)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct RawEntry {
+    pub id: i64,
+    pub session_id: String,
+    pub timestamp: String,
+    pub date: String,
+    pub time: String,
+    pub entry_type: String,
+    pub tool_name: Option<String>,
+    pub content: String,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+}
+
+pub fn insert_entry(
+    conn: &Connection,
+    session_id: &str,
+    timestamp: &str,
+    date: &str,
+    time: &str,
+    entry_type: &str,
+    tool_name: Option<&str>,
+    content: &str,
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO raw_entries (session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![session_id, timestamp, date, time, entry_type, tool_name, content, cwd, git_branch],
+    )?;
+    let id = conn.last_insert_rowid();
+
+    // FTS に同期
+    conn.execute(
+        "INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![id, content, tool_name, session_id],
+    )?;
+
+    Ok(id)
+}
+
+pub fn get_sync_offset(conn: &Connection, file_path: &str) -> Result<i64> {
+    let offset = conn
+        .query_row(
+            "SELECT last_offset FROM sync_state WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get(0),
+        )
+        .unwrap_or(0i64);
+    Ok(offset)
+}
+
+pub fn set_sync_offset(conn: &Connection, file_path: &str, offset: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sync_state (file_path, last_offset) VALUES (?1, ?2)
+         ON CONFLICT(file_path) DO UPDATE SET last_offset = ?2",
+        params![file_path, offset],
+    )?;
+    Ok(())
+}
+
+pub fn stats(conn: &Connection) -> Result<String> {
+    let entry_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM raw_entries", [], |row| row.get(0))?;
+    let session_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT session_id) FROM raw_entries",
+        [],
+        |row| row.get(0),
+    )?;
+    let date_range: (Option<String>, Option<String>) = conn.query_row(
+        "SELECT MIN(date), MAX(date) FROM raw_entries",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let sync_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM sync_state", [], |row| row.get(0))?;
+    let summary_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))?;
+
+    let min_date = date_range.0.unwrap_or_else(|| "(none)".to_string());
+    let max_date = date_range.1.unwrap_or_else(|| "(none)".to_string());
+
+    Ok(format!(
+        "Entries:    {entry_count}\n\
+         Sessions:   {session_count}\n\
+         Date range: {min_date} .. {max_date}\n\
+         Summaries:  {summary_count}\n\
+         Tracked files: {sync_count}"
+    ))
+}
+
+/// FTS 検索（クエリが空や "*" の場合は FTS を使わず直接検索）
+pub fn search(
+    conn: &Connection,
+    query: &str,
+    date: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    entry_type: Option<&str>,
+    session_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<RawEntry>> {
+    let trimmed = query.trim();
+    let use_fts = !trimmed.is_empty() && trimmed != "*";
+
+    let mut sql;
+    let mut param_idx;
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut conditions = Vec::new();
+
+    if use_fts {
+        sql = String::from(
+            "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type,
+                    r.tool_name, snippet(raw_entries_fts, 0, '>>','<<', '...', 40) as content,
+                    r.cwd, r.git_branch
+             FROM raw_entries_fts f
+             JOIN raw_entries r ON r.id = f.rowid
+             WHERE raw_entries_fts MATCH ?1",
+        );
+        param_values.push(Box::new(trimmed.to_string()));
+        param_idx = 2;
+    } else {
+        sql = String::from(
+            "SELECT id, session_id, timestamp, date, time, type,
+                    tool_name, substr(content, 1, 200) as content,
+                    cwd, git_branch
+             FROM raw_entries
+             WHERE 1=1",
+        );
+        param_idx = 1;
+    }
+
+    // FTS時は r. プレフィックス（JOINのエイリアス）、非FTS時はプレフィックスなし
+    let col = |name: &str| -> String {
+        if use_fts { format!("r.{name}") } else { name.to_string() }
+    };
+
+    if let Some(d) = date {
+        conditions.push(format!("{} = ?{param_idx}", col("date")));
+        param_values.push(Box::new(d.to_string()));
+        param_idx += 1;
+    }
+    if let Some(df) = date_from {
+        conditions.push(format!("{} >= ?{param_idx}", col("date")));
+        param_values.push(Box::new(df.to_string()));
+        param_idx += 1;
+    }
+    if let Some(dt) = date_to {
+        conditions.push(format!("{} <= ?{param_idx}", col("date")));
+        param_values.push(Box::new(dt.to_string()));
+        param_idx += 1;
+    }
+    if let Some(t) = entry_type {
+        conditions.push(format!("{} = ?{param_idx}", col("type")));
+        param_values.push(Box::new(t.to_string()));
+        param_idx += 1;
+    }
+    if let Some(s) = session_id {
+        conditions.push(format!("{} = ?{param_idx}", col("session_id")));
+        param_values.push(Box::new(s.to_string()));
+        param_idx += 1;
+    }
+
+    for c in &conditions {
+        sql.push_str(" AND ");
+        sql.push_str(c);
+    }
+    sql.push_str(&format!(" ORDER BY {} DESC LIMIT ?{param_idx}", col("timestamp")));
+    param_values.push(Box::new(limit));
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_ref.as_slice(), |row| {
+        Ok(RawEntry {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            timestamp: row.get(2)?,
+            date: row.get(3)?,
+            time: row.get(4)?,
+            entry_type: row.get(5)?,
+            tool_name: row.get(6)?,
+            content: row.get(7)?,
+            cwd: row.get(8)?,
+            git_branch: row.get(9)?,
+        })
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+/// エントリ全文取得
+pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch
+         FROM raw_entries WHERE id = ?1",
+    )?;
+    let entry = stmt
+        .query_row(params![id], |row| {
+            Ok(RawEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                timestamp: row.get(2)?,
+                date: row.get(3)?,
+                time: row.get(4)?,
+                entry_type: row.get(5)?,
+                tool_name: row.get(6)?,
+                content: row.get(7)?,
+                cwd: row.get(8)?,
+                git_branch: row.get(9)?,
+            })
+        })
+        .ok();
+    Ok(entry)
+}
+
+/// セッション一覧
+pub fn list_sessions(
+    conn: &Connection,
+    date: Option<&str>,
+    limit: i64,
+) -> Result<Vec<(String, String, String, String, i64)>> {
+    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(d) = date {
+        (
+            "SELECT session_id, MIN(timestamp), MAX(timestamp), date, COUNT(*)
+             FROM raw_entries WHERE date = ?1
+             GROUP BY session_id ORDER BY MIN(timestamp) DESC LIMIT ?2"
+                .to_string(),
+            vec![Box::new(d.to_string()), Box::new(limit)],
+        )
+    } else {
+        (
+            "SELECT session_id, MIN(timestamp), MAX(timestamp), date, COUNT(*)
+             FROM raw_entries
+             GROUP BY session_id ORDER BY MIN(timestamp) DESC LIMIT ?1"
+                .to_string(),
+            vec![Box::new(limit)],
+        )
+    };
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_ref.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
+}
+
+/// 特定セッションのエントリ取得
+pub fn get_session_entries(
+    conn: &Connection,
+    session_id: &str,
+    entry_type: Option<&str>,
+    limit: i64,
+) -> Result<Vec<RawEntry>> {
+    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(t) = entry_type {
+        let types: Vec<&str> = t.split(',').collect();
+        let placeholders: Vec<String> = (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
+        let mut pv: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(session_id.to_string())];
+        for ty in &types {
+            pv.push(Box::new(ty.trim().to_string()));
+        }
+        let limit_idx = pv.len() + 1;
+        pv.push(Box::new(limit));
+        (
+            format!(
+                "SELECT id, session_id, timestamp, date, time, type, tool_name,
+                        substr(content, 1, 200) as content, cwd, git_branch
+                 FROM raw_entries WHERE session_id = ?1 AND type IN ({})
+                 ORDER BY timestamp ASC LIMIT ?{limit_idx}",
+                placeholders.join(", ")
+            ),
+            pv,
+        )
+    } else {
+        (
+            "SELECT id, session_id, timestamp, date, time, type, tool_name,
+                    substr(content, 1, 200) as content, cwd, git_branch
+             FROM raw_entries WHERE session_id = ?1 AND type IN ('user', 'assistant')
+             ORDER BY timestamp ASC LIMIT ?2"
+                .to_string(),
+            vec![Box::new(session_id.to_string()), Box::new(limit)],
+        )
+    };
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_ref.as_slice(), |row| {
+        Ok(RawEntry {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            timestamp: row.get(2)?,
+            date: row.get(3)?,
+            time: row.get(4)?,
+            entry_type: row.get(5)?,
+            tool_name: row.get(6)?,
+            content: row.get(7)?,
+            cwd: row.get(8)?,
+            git_branch: row.get(9)?,
+        })
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
