@@ -1,103 +1,103 @@
-# claude-relay: Claude Codeのセッション記憶を雑に保存するやつ
+# claude-relay: A Quick-and-Dirty Session Memory Store for Claude Code
 
-## 経緯
+## Background
 
-[claude-mem](https://github.com/anthropics/claude-mem)（Claude Code のセッション記憶プラグイン）をローカル LLM で使えるようにしようとフォークしてソースコードを読んだところ、正直なところ使い物になりませんでした。
+I forked [claude-mem](https://github.com/anthropics/claude-mem) (a session memory plugin for Claude Code) intending to make it work with local LLMs, but after reading through the source code, I honestly found it unusable.
 
-1件のツール使用ごとに AI 圧縮リクエストを飛ばす設計、タイムアウトなしの fetch、リトライ戦略の欠如、liveness と readiness の混同、圧縮後に生データを捨てる不可逆な処理 — コンピュータサイエンスの基礎が押さえられていない実装でした。詳しくは[別の記事](https://note.com/veltrea/n/n791d1defada0)に書いています。
+The design fires off an AI compression request for every single tool use, uses fetch with no timeout, has no retry strategy, conflates liveness with readiness, and irreversibly discards raw data after compression -- it's an implementation that misses the fundamentals of computer science. I wrote about the details in a [separate article](https://note.com/veltrea/n/n791d1defada0).
 
-Claude API 前提なら問題が表面化しないだけで、ローカル LLM に切り替えた瞬間に全部が致命的になります。フォーク元の修正を試みましたが、設計思想の問題なので部分的なパッチでは直せません。
+These problems just don't surface when you're using the Claude API, but the moment you switch to a local LLM, every single one of them becomes fatal. I tried patching the fork, but these are design-level issues that can't be fixed with partial patches.
 
-で、考えてみたら AI で圧縮する必要なんてそもそもないんですよね。Claude Code は全セッションデータを `~/.claude/projects/` に JSONL で書き出しています。これを SQLite に突っ込んで、検索時に Claude 自身の 1M コンテキストで生データを理解させればいい。AI 圧縮もデーモンも要らない。
+And then it hit me -- there's no reason to use AI compression in the first place. Claude Code already writes all session data as JSONL under `~/.claude/projects/`. Just shove it into SQLite and let Claude's own 1M context understand the raw data at query time. No AI compression, no daemon needed.
 
-そういうわけで **claude-relay** をゼロから作りました。
+So I built **claude-relay** from scratch.
 
-## どういうものか
+## What It Is
 
-- Rust 製のシングルバイナリ（約1,600行）
-- MCP サーバーとして Claude Code に接続し、過去のセッションを検索するツールを提供します
-- デーモン不要。セッション開始時やツール呼び出し時に JSONL を差分取り込みします
-- 古いデータは Markdown にアーカイブして SQLite から消す、みたいな運用もできます
+- A single Rust binary (around 1,600 lines)
+- Connects to Claude Code as an MCP server and provides tools for searching past sessions
+- No daemon required. It incrementally ingests JSONL files at session start and on tool invocations
+- You can also archive old data to Markdown and prune it from SQLite if you like
 
-## インストール
+## Installation
 
-Rust のビルド環境が必要です。
+You'll need a Rust build environment.
 
 ```bash
 git clone https://github.com/veltrea/claude-relay.git
 cd claude-relay
 cargo build --release
 
-# Claude Code の MCP に登録
+# Register as an MCP server in Claude Code
 claude mcp add --transport stdio --scope user claude-relay -- $(pwd)/target/release/claude-relay serve
 ```
 
-パスを通したい人は `target/release/claude-relay` を好きな場所にコピーしてください。
+If you want it on your PATH, just copy `target/release/claude-relay` wherever you like.
 
-## 使い方
+## Usage
 
-### まず JSONL を取り込む
+### First, Ingest the JSONL Files
 
 ```bash
-# ~/.claude/projects/ 配下の全セッションを取り込み
+# Ingest all sessions under ~/.claude/projects/
 claude-relay ingest ~/.claude/projects/
 
-# 特定のファイルだけ
+# Or just a specific file
 claude-relay ingest path/to/session.jsonl
 
-# どれくらい入ったか確認
+# Check how much got imported
 claude-relay db stats
 ```
 
-自分の環境では 48 セッション、75,000 エントリくらいが入りました。
+On my setup, that came out to about 48 sessions and 75,000 entries.
 
-### Claude Code から使う
+### Using It from Claude Code
 
-MCP ツールとして登録してあるので、Claude Code のセッション内で普通に聞けます。
+Since it's registered as an MCP tool, you can just ask naturally within a Claude Code session:
 
-- 「昨日の作業内容を教えて」
-- 「OAuth 修正した時のやつ探して」
-- 「3月20日から23日の間に何やってた？」
-- 「最近のセッション一覧を見せて」
+- "Tell me what I worked on yesterday"
+- "Find the thing where I fixed OAuth"
+- "What was I doing between March 20th and 23rd?"
+- "Show me my recent sessions"
 
-裏では `memory_search`、`memory_list_sessions`、`memory_get_session` 等の MCP ツールが呼ばれています。
+Under the hood, MCP tools like `memory_search`, `memory_list_sessions`, and `memory_get_session` are being called.
 
-### CLI でも使える
+### CLI Usage
 
-人間が直接叩く管理コマンドもあります。MCP ツール経由だとトークンを食うので、管理系は CLI でやる設計です。
+There are also management commands for direct human use. Since going through MCP tools eats up tokens, admin tasks are designed to be done via the CLI.
 
 ```bash
-# セッション一覧
+# List sessions
 claude-relay list
 claude-relay list --date 2026-03-23
 
-# セッションの中身を Markdown で出力
+# Export a session's contents as Markdown
 claude-relay export <session_id>
 claude-relay export --date 2026-03-23
 
-# DB のリセット
+# Reset the DB
 claude-relay db reset
 
-# 生 SQL も叩ける（開発時に便利）
+# Run raw SQL (handy during development)
 claude-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
 
-# テスト用に手動で書き込み
-claude-relay write "テストメッセージ" --type user
+# Manually write an entry (for testing)
+claude-relay write "Test message" --type user
 ```
 
-## 設計の話
+## Design Notes
 
-### 全部保存して、読む時に絞る
+### Store Everything, Filter on Read
 
-最初は `user` と `assistant` だけ保存しようとしていたんですが、「全部突っ込んで読み出し時に WHERE で絞ればよくない？」と思い直しました。`system`、`progress`、`queue-operation` も全部入れています。後から「やっぱりあのデータ見たい」となっても対応できます。
+I initially planned to store only `user` and `assistant` entries, but then I thought, "Why not just dump everything in and filter with WHERE clauses on read?" So `system`, `progress`, `queue-operation` -- it all goes in. That way, if you later decide you want to look at some piece of data, it's already there.
 
-### デーモン不要
+### No Daemon
 
-ファイル監視デーモン（chokidar 等）を常駐させる案もありましたが、やめました。SessionStart フックと MCP ツール呼び出し時に差分取り込みする方式にしています。JSONL の「前回どこまで読んだか」をバイトオフセットで記録しておいて、新しい行だけ処理します。
+I considered running a file-watching daemon (like chokidar), but decided against it. Instead, it does incremental ingestion on the SessionStart hook and on MCP tool invocations. It records a byte offset for "how far we've read" in each JSONL file and only processes new lines.
 
-### アーカイブ
+### Archiving
 
-設定ファイル（`~/.claude-relay/config.json`）で `retention_days` を指定すると、期限切れのデータを Markdown に書き出して DB から消せます。デフォルトは 30 日です。
+If you set `retention_days` in the config file (`~/.claude-relay/config.json`), expired data gets exported to Markdown and removed from the DB. The default is 30 days.
 
 ```jsonc
 {
@@ -106,14 +106,14 @@ claude-relay write "テストメッセージ" --type user
 }
 ```
 
-## 注意事項
+## Heads Up
 
-30 分くらいで作りました。テストはほとんどやっていません。自分の環境（macOS）では動いていますが、他の環境は試していません。
+I threw this together in about 30 minutes. There's barely any testing. It works on my machine (macOS), but I haven't tried it anywhere else.
 
-バグを見つけた方、動かなかった方は [Issue](https://github.com/veltrea/claude-relay/issues) で教えてもらえると助かります。
+If you find a bug or it doesn't work for you, I'd appreciate it if you let me know via [Issues](https://github.com/veltrea/claude-relay/issues).
 
-PR は受け付けていません。思いついたら丸ごとコードを書き換えるタイプなので、PR をもらっても元のコードが残っていない可能性が高いです。気になった方はフォークして自由にやってください。バイブコーディングすれば誰でも作れます。
+I'm not accepting PRs. I'm the type to rewrite the entire codebase on a whim, so there's a good chance the original code won't even exist by the time a PR comes in. If you're interested, feel free to fork it and do whatever you want with it. Anyone can build something like this with vibe coding.
 
-## ライセンス
+## License
 
 MIT License
