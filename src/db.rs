@@ -9,6 +9,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 pub fn init(conn: &Connection) -> Result<()> {
+    // 基本スキーマ（client カラムなしの旧DBでも通る）
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS raw_entries (
@@ -22,7 +23,6 @@ pub fn init(conn: &Connection) -> Result<()> {
             content TEXT NOT NULL,
             cwd TEXT,
             git_branch TEXT,
-            client TEXT NOT NULL DEFAULT 'claude-code',
             created_at TEXT DEFAULT (datetime('now'))
         );
 
@@ -30,7 +30,7 @@ pub fn init(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_raw_timestamp ON raw_entries(timestamp);
         CREATE INDEX IF NOT EXISTS idx_raw_date ON raw_entries(date);
         CREATE INDEX IF NOT EXISTS idx_raw_type ON raw_entries(type);
-        CREATE INDEX IF NOT EXISTS idx_raw_client ON raw_entries(client);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS raw_entries_fts USING fts5(
             content, tool_name, session_id
         );
@@ -42,9 +42,15 @@ pub fn init(conn: &Connection) -> Result<()> {
         ",
     )?;
 
-    // マイグレーション: 既存DBに client カラムがなければ追加
+    // マイグレーション: client カラムが存在しなければ追加（失敗は無視）
     let _ = conn.execute(
         "ALTER TABLE raw_entries ADD COLUMN client TEXT NOT NULL DEFAULT 'claude-code'",
+        [],
+    );
+
+    // client カラム確定後にインデックスを作成
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_raw_client ON raw_entries(client)",
         [],
     );
 
