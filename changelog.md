@@ -2,9 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.1] - 2026-03-27
 
 ### Fixed
-- **Memory Tools**: Removed the `memory_get_summary` tool and the underlying `summaries` table.
-  - *Bugfix Context*: AI agents generating and storing summaries from raw data proved to be counterproductive, as the quality of summaries degrades over time and varies between different models (e.g., Claude vs. Gemini). Relying on the `memory_get_summary` tool occasionally caused agents to hallucinate or get confused when an empty summary was returned.
-  - *Resolution*: Agents will now dynamically generate context directly from the raw fast-search engine (FTS) entries, ensuring higher accuracy and eliminating state sync issues.
+- Fix `limit` parameter parsing: accept both JSON integer and float (AI may pass integers as floats)
+- Fix `memory_unlock_cross_scope`: accept `confirmed` as both JSON boolean and string `"true"`
+- Fix `db::init`: create `client` index after migration to avoid column-not-found error
+- Remove emoji characters from MCP response messages
+
+## [0.2.0] - 2026-03-27
+
+### Fixed
+- Remove orphaned `memory_get_summary` tool that referenced a non-existent summaries table
+  - The summaries feature was removed in an earlier refactor, but the MCP tool was left behind, causing AI to report errors when it tried to call it
+
+### Added
+- Workspace scoping: memory tools now default to the current workspace only, preventing unrelated workspaces from polluting the context window
+- `memory_unlock_cross_scope` tool: cross-workspace search requires explicit user approval per session
+- Client detection: MCP server detects the launching AI client via parent process (PPID) and MCP `initialize` `clientInfo`
+- `client` field added to `raw_entries` table (auto-migrated on first run)
+- Sync-on-tool-call fallback: JSONL sync runs automatically on every MCP tool call in addition to the session start hook
+- GitHub Actions release workflow: multi-platform binaries (macOS arm64/x86_64, Linux x86_64, Windows x86_64)
+
+## [0.1.0] - 2026-03-24
+
+### Initial Release
+- SQLite-backed session memory for Claude Code
+- MCP server with `memory_search`, `memory_get_entry`, `memory_list_sessions`, `memory_get_session`
+- JSONL incremental sync with byte-offset tracking
+- Session start hook and summary hook support
+- CLI commands: `serve`, `db`, `list`, `export`, `ingest`, `sync`, `query`, `write`
+- Archive strategy: retention days + Markdown export

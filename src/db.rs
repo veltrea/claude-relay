@@ -162,6 +162,35 @@ pub fn stats(conn: &Connection) -> Result<String> {
     ))
 }
 
+/// FTS5クエリを正規化する。
+/// ハイフンはFTS5で否定演算子として解釈されるため、単語間のハイフンをスペースに置き換える。
+/// ユーザーが明示的にクォートした部分はそのまま通す。
+fn normalize_fts_query(query: &str) -> String {
+    // クォートされていない部分のハイフンをスペースに置き換える
+    let mut result = String::with_capacity(query.len());
+    let mut in_quote = false;
+    let chars: Vec<char> = query.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                result.push(c);
+            }
+            '-' if !in_quote => {
+                // 単語の先頭の - (NOT演算子) は残す。単語間は空白に変換する
+                let prev_is_word = i > 0 && chars[i - 1].is_alphanumeric();
+                if prev_is_word {
+                    result.push(' ');
+                } else {
+                    result.push(c);
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
 pub fn search(
     conn: &Connection,
     query: &str,
@@ -190,7 +219,9 @@ pub fn search(
              JOIN raw_entries r ON r.id = f.rowid
              WHERE raw_entries_fts MATCH ?1",
         );
-        param_values.push(Box::new(trimmed.to_string()));
+        // FTS5はハイフンを否定演算子として扱うため、単語間のハイフンをスペースに正規化する
+        let fts_query = normalize_fts_query(trimmed);
+        param_values.push(Box::new(fts_query));
         param_idx = 2;
     } else {
         sql = String::from(
