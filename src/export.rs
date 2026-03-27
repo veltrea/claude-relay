@@ -45,7 +45,7 @@ pub fn export_session(conn: &Connection, session_id: &str) -> Result<String> {
 
 /// 日付指定で全セッションをエクスポート
 pub fn export_date(conn: &Connection, date: &str) -> Result<String> {
-    let sessions = db::list_sessions(conn, Some(date), 100)?;
+    let sessions = db::list_sessions(conn, Some(date), 100, None)?;
     if sessions.is_empty() {
         anyhow::bail!("No sessions found for date: {date}");
     }

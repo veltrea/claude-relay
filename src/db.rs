@@ -282,24 +282,37 @@ pub fn list_sessions(
     conn: &Connection,
     date: Option<&str>,
     limit: i64,
+    workspace: Option<&str>,
 ) -> Result<Vec<(String, String, String, String, i64)>> {
-    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(d) = date {
-        (
-            "SELECT session_id, MIN(timestamp), MAX(timestamp), date, COUNT(*)
-             FROM raw_entries WHERE date = ?1
-             GROUP BY session_id ORDER BY MIN(timestamp) DESC LIMIT ?2"
-                .to_string(),
-            vec![Box::new(d.to_string()), Box::new(limit)],
-        )
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut idx = 1usize;
+
+    if let Some(d) = date {
+        conditions.push(format!("date = ?{idx}"));
+        params_vec.push(Box::new(d.to_string()));
+        idx += 1;
+    }
+    if let Some(ws) = workspace {
+        conditions.push(format!("cwd LIKE ?{idx}"));
+        params_vec.push(Box::new(format!("{ws}%")));
+        idx += 1;
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
     } else {
-        (
-            "SELECT session_id, MIN(timestamp), MAX(timestamp), date, COUNT(*)
-             FROM raw_entries
-             GROUP BY session_id ORDER BY MIN(timestamp) DESC LIMIT ?1"
-                .to_string(),
-            vec![Box::new(limit)],
-        )
+        format!("WHERE {}", conditions.join(" AND "))
     };
+
+    let sql = format!(
+        "SELECT session_id, MIN(timestamp), MAX(timestamp), date, COUNT(*)
+         FROM raw_entries {where_clause}
+         GROUP BY session_id ORDER BY MIN(timestamp) DESC LIMIT ?{idx}"
+    );
+    params_vec.push(Box::new(limit));
+
+    let (sql, params_vec) = (sql, params_vec);
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;

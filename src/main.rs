@@ -233,7 +233,7 @@ fn main() -> Result<()> {
         }
 
         Commands::List { date, limit } => {
-            let sessions = db::list_sessions(&conn, date.as_deref(), limit)?;
+            let sessions = db::list_sessions(&conn, date.as_deref(), limit, None)?;
             if sessions.is_empty() {
                 println!("No sessions found.");
             } else {
@@ -395,7 +395,7 @@ fn main() -> Result<()> {
                 }
                 "memory_list_sessions" => {
                     let sessions =
-                        db::list_sessions(&conn, date.as_deref(), limit.unwrap_or(10))?;
+                        db::list_sessions(&conn, date.as_deref(), limit.unwrap_or(10), None)?;
                     for (sid, _first, _last, date, count) in &sessions {
                         println!("{sid}  {date}  {count} entries");
                     }

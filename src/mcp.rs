@@ -138,7 +138,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "memory_search",
-            "description": "Search session memory by keyword and date. Results are scoped to the current workspace.",
+            "description": "Search session memory by keyword and date. By default, results are scoped to the current workspace only. Use scope=\"all\" to search across all workspaces.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -148,7 +148,8 @@ fn tool_definitions() -> Value {
                     "date_to": { "type": "string", "description": "Date range end" },
                     "type": { "type": "string", "description": "Filter by type (user/assistant/system)" },
                     "session_id": { "type": "string", "description": "Filter by session" },
-                    "limit": { "type": "number", "description": "Max results (default 20)" }
+                    "limit": { "type": "number", "description": "Max results (default 20)" },
+                    "scope": { "type": "string", "description": "\"self\" (default, current workspace only) or \"all\" (all workspaces)" }
                 },
                 "required": ["query"]
             }
@@ -166,12 +167,13 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "memory_list_sessions",
-            "description": "List recent sessions with timestamps and entry counts.",
+            "description": "List recent sessions with timestamps and entry counts. By default, shows only sessions from the current workspace. Use scope=\"all\" to list sessions across all workspaces.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "date": { "type": "string", "description": "Filter by date (YYYY-MM-DD)" },
-                    "limit": { "type": "number", "description": "Max results (default 10)" }
+                    "limit": { "type": "number", "description": "Max results (default 10)" },
+                    "scope": { "type": "string", "description": "\"self\" (default, current workspace only) or \"all\" (all workspaces)" }
                 }
             }
         },
@@ -209,10 +211,12 @@ fn handle_tool_call(conn: &rusqlite::Connection, params: &Value, state: &mut Ser
             let entry_type = args.get("type").and_then(|t| t.as_str());
             let session_id = args.get("session_id").and_then(|s| s.as_str());
             let limit = args.get("limit").and_then(|l| l.as_i64()).unwrap_or(20);
+            let scope = args.get("scope").and_then(|s| s.as_str()).unwrap_or("self");
+            let ws_filter = if scope == "all" { None } else { state.workspace.as_deref() };
 
             let entries = db::search(
                 conn, query, date, date_from, date_to, entry_type, session_id, limit,
-                state.workspace.as_deref()
+                ws_filter
             )?;
             Ok(serde_json::to_string_pretty(&format_entries(&entries))?)
         }
@@ -237,7 +241,9 @@ fn handle_tool_call(conn: &rusqlite::Connection, params: &Value, state: &mut Ser
         "memory_list_sessions" => {
             let date = args.get("date").and_then(|d| d.as_str());
             let limit = args.get("limit").and_then(|l| l.as_i64()).unwrap_or(10);
-            let sessions = db::list_sessions(conn, date, limit)?;
+            let scope = args.get("scope").and_then(|s| s.as_str()).unwrap_or("self");
+            let ws_filter = if scope == "all" { None } else { state.workspace.as_deref() };
+            let sessions = db::list_sessions(conn, date, limit, ws_filter)?;
             let result: Vec<Value> = sessions
                 .iter()
                 .map(|(sid, first, last, date, count)| {
