@@ -22,6 +22,7 @@ pub fn init(conn: &Connection) -> Result<()> {
             content TEXT NOT NULL,
             cwd TEXT,
             git_branch TEXT,
+            client TEXT NOT NULL DEFAULT 'claude-code',
             created_at TEXT DEFAULT (datetime('now'))
         );
 
@@ -29,6 +30,7 @@ pub fn init(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_raw_timestamp ON raw_entries(timestamp);
         CREATE INDEX IF NOT EXISTS idx_raw_date ON raw_entries(date);
         CREATE INDEX IF NOT EXISTS idx_raw_type ON raw_entries(type);
+        CREATE INDEX IF NOT EXISTS idx_raw_client ON raw_entries(client);
         CREATE VIRTUAL TABLE IF NOT EXISTS raw_entries_fts USING fts5(
             content, tool_name, session_id
         );
@@ -39,6 +41,12 @@ pub fn init(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+
+    // マイグレーション: 既存DBに client カラムがなければ追加
+    let _ = conn.execute(
+        "ALTER TABLE raw_entries ADD COLUMN client TEXT NOT NULL DEFAULT 'claude-code'",
+        [],
+    );
 
     Ok(())
 }
@@ -67,6 +75,7 @@ pub struct RawEntry {
     pub content: String,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
+    pub client: String,
 }
 
 pub fn insert_entry(
@@ -80,12 +89,13 @@ pub fn insert_entry(
     content: &str,
     cwd: Option<&str>,
     git_branch: Option<&str>,
+    client: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO raw_entries (session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO raw_entries (session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch, client)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
-            session_id, timestamp, date, time, entry_type, tool_name, content, cwd, git_branch
+            session_id, timestamp, date, time, entry_type, tool_name, content, cwd, git_branch, client
         ],
     )?;
     let id = conn.last_insert_rowid();
@@ -169,7 +179,7 @@ pub fn search(
         sql = String::from(
             "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type,
                     r.tool_name, snippet(raw_entries_fts, 0, '>>','<<', '...', 40) as content,
-                    r.cwd, r.git_branch
+                    r.cwd, r.git_branch, r.client
              FROM raw_entries_fts f
              JOIN raw_entries r ON r.id = f.rowid
              WHERE raw_entries_fts MATCH ?1",
@@ -180,7 +190,7 @@ pub fn search(
         sql = String::from(
             "SELECT id, session_id, timestamp, date, time, type,
                     tool_name, substr(content, 1, 200) as content,
-                    cwd, git_branch
+                    cwd, git_branch, client
              FROM raw_entries
              WHERE 1=1",
         );
@@ -244,6 +254,7 @@ pub fn search(
             content: row.get(7)?,
             cwd: row.get(8)?,
             git_branch: row.get(9)?,
+            client: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "claude-code".to_string()),
         })
     })?;
 
@@ -256,7 +267,7 @@ pub fn search(
 
 pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch
+        "SELECT id, session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch, client
          FROM raw_entries WHERE id = ?1",
     )?;
     let entry = stmt
@@ -272,6 +283,7 @@ pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
                 content: row.get(7)?,
                 cwd: row.get(8)?,
                 git_branch: row.get(9)?,
+                client: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "claude-code".to_string()),
             })
         })
         .ok();
@@ -351,7 +363,7 @@ pub fn get_session_entries(
         (
             format!(
                 "SELECT id, session_id, timestamp, date, time, type, tool_name,
-                        substr(content, 1, 200) as content, cwd, git_branch
+                        substr(content, 1, 200) as content, cwd, git_branch, client
                  FROM raw_entries WHERE session_id = ?1 AND type IN ({})
                  ORDER BY timestamp ASC LIMIT ?{limit_idx}",
                 placeholders.join(", ")
@@ -361,7 +373,7 @@ pub fn get_session_entries(
     } else {
         (
             "SELECT id, session_id, timestamp, date, time, type, tool_name,
-                    substr(content, 1, 200) as content, cwd, git_branch
+                    substr(content, 1, 200) as content, cwd, git_branch, client
              FROM raw_entries WHERE session_id = ?1 AND type IN ('user', 'assistant')
              ORDER BY timestamp ASC LIMIT ?2"
                 .to_string(),
@@ -383,6 +395,7 @@ pub fn get_session_entries(
             content: row.get(7)?,
             cwd: row.get(8)?,
             git_branch: row.get(9)?,
+            client: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "claude-code".to_string()),
         })
     })?;
 

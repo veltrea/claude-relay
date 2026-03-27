@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod detect;
 mod export;
 mod ingest;
 mod mcp;
@@ -312,7 +313,7 @@ fn main() -> Result<()> {
             let date = now.format("%Y-%m-%d").to_string();
             let time = now.format("%H:%M:%S").to_string();
             let id = db::insert_entry(
-                &conn, &session, &ts, &date, &time, &r#type, None, &content, None, None,
+                &conn, &session, &ts, &date, &time, &r#type, None, &content, None, None, "claude-code",
             )?;
             println!("Inserted entry id={id} type={} session={session}", r#type);
         }

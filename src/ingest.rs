@@ -62,6 +62,7 @@ pub fn ingest_file(conn: &Connection, path: &Path) -> Result<u64> {
                 &n.content,
                 n.cwd.as_deref(),
                 n.git_branch.as_deref(),
+                "claude-code",
             )?;
             count += 1;
         }

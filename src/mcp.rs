@@ -3,11 +3,13 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use crate::config::Config;
 use crate::db;
+use crate::detect;
 use crate::ingest;
 
 /// サーバー状態
 struct ServerState {
     workspace: Option<String>,
+    client: String,
 }
 
 /// MCP stdio サーバーを起動
@@ -16,12 +18,17 @@ pub fn serve(workspace: Option<String>) -> Result<()> {
     let conn = db::open(&db_path)?;
     db::init(&conn)?;
 
+    // 親プロセスからクライアントを推定
+    let detected_client = detect::detect_from_ppid();
+
     let mut state = ServerState {
         workspace: workspace.or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string())),
+        client: detected_client.clone(),
     };
 
     eprintln!(
-        "claude-relay: mcp server started. workspace={}",
+        "claude-relay: mcp server started. client={} workspace={}",
+        state.client,
         state.workspace.as_deref().unwrap_or("(none)")
     );
 
@@ -39,12 +46,25 @@ pub fn serve(workspace: Option<String>) -> Result<()> {
             Err(_) => continue,
         };
 
-        // initialize から roots を拾ってワークスペース確定
+        // initialize から clientInfo と roots を取得
         if request.get("method").and_then(|m| m.as_str()) == Some("initialize") {
+            let params = request.get("params").cloned().unwrap_or(json!({}));
+
+            // clientInfo.name でクライアントを上書き
+            if let Some(name) = params
+                .get("clientInfo")
+                .and_then(|c| c.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                let normalized = detect::normalize_client_info(name);
+                eprintln!("claude-relay: client from clientInfo={normalized} (raw={name})");
+                state.client = normalized;
+            }
+
+            // roots からワークスペースを取得
             if state.workspace.is_none() {
-                if let Some(uri) = request
-                    .get("params")
-                    .and_then(|p| p.get("roots"))
+                if let Some(uri) = params
+                    .get("roots")
                     .and_then(|r| r.as_array())
                     .and_then(|arr| arr.first())
                     .and_then(|r| r.get("uri"))
@@ -75,20 +95,36 @@ fn handle_request(conn: &rusqlite::Connection, request: &Value, state: &mut Serv
     let params = request.get("params").cloned().unwrap_or(json!({}));
 
     match method {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
+        "initialize" => {
+            let is_claude = state.client == "claude-code";
+            let mut result = json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {}
                 },
                 "serverInfo": {
                     "name": "claude-relay",
-                    "version": "0.2.0"
+                    "version": "0.2.0",
+                    "detectedClient": state.client
                 }
+            });
+
+            // 非Claudeクライアントには警告を付加
+            if !is_claude {
+                result["_warning"] = json!(
+                    "⚠️ claude-relay is designed for Claude Code. \
+                     Running under a different client may cause unexpected behavior. \
+                     Memory data is sourced from Claude Code session logs (~/.claude/projects/**/*.jsonl). \
+                     Full multi-client support is planned for agents-relay (next major version)."
+                );
             }
-        }),
+
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result
+            })
+        }
         "notifications/initialized" => Value::Null,
         "tools/list" => json!({
             "jsonrpc": "2.0",
@@ -297,6 +333,7 @@ fn format_entries(entries: &[db::RawEntry]) -> Vec<Value> {
                 "content": e.content,
                 "cwd": e.cwd,
                 "git_branch": e.git_branch,
+                "client": e.client,
             })
         })
         .collect()
