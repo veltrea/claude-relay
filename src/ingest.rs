@@ -86,7 +86,7 @@ pub fn ingest_dir(conn: &Connection, dir: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// ~/.claude/projects 配下を全部取り込み
+/// Claude Code の全プロジェクトを取り込み
 pub fn sync_all(conn: &Connection) -> Result<u64> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
     let projects_dir = home.join(".claude").join("projects");

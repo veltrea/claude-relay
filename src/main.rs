@@ -18,7 +18,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start MCP server (stdio)
-    Serve,
+    Serve {
+        /// Workspace path for scoped queries (defaults to all)
+        #[arg(long)]
+        workspace: Option<String>,
+    },
 
     /// Database management
     Db {
@@ -157,8 +161,8 @@ fn main() -> Result<()> {
     db::init(&conn)?;
 
     match cli.command {
-        Commands::Serve => {
-            mcp::serve()?;
+        Commands::Serve { workspace } => {
+            mcp::serve(workspace)?;
         }
 
         Commands::Db { action } => match action {
@@ -381,6 +385,7 @@ fn main() -> Result<()> {
                         None,
                         session_id.as_deref(),
                         limit.unwrap_or(20),
+                        None, // workspace
                     )?;
                     for e in &entries {
                         let preview = &e.content[..e.content.len().min(120)];

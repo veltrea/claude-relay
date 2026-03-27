@@ -5,11 +5,25 @@ use crate::config::Config;
 use crate::db;
 use crate::ingest;
 
+/// サーバー状態
+struct ServerState {
+    workspace: Option<String>,
+}
+
 /// MCP stdio サーバーを起動
-pub fn serve() -> Result<()> {
+pub fn serve(workspace: Option<String>) -> Result<()> {
     let db_path = Config::db_path();
     let conn = db::open(&db_path)?;
     db::init(&conn)?;
+
+    let mut state = ServerState {
+        workspace: workspace.or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string())),
+    };
+
+    eprintln!(
+        "claude-relay: mcp server started. workspace={}",
+        state.workspace.as_deref().unwrap_or("(none)")
+    );
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -25,7 +39,25 @@ pub fn serve() -> Result<()> {
             Err(_) => continue,
         };
 
-        let response = handle_request(&conn, &request);
+        // initialize から roots を拾ってワークスペース確定
+        if request.get("method").and_then(|m| m.as_str()) == Some("initialize") {
+            if state.workspace.is_none() {
+                if let Some(uri) = request
+                    .get("params")
+                    .and_then(|p| p.get("roots"))
+                    .and_then(|r| r.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|r| r.get("uri"))
+                    .and_then(|u| u.as_str())
+                {
+                    let path = uri.strip_prefix("file://").unwrap_or(uri);
+                    state.workspace = Some(path.to_string());
+                    eprintln!("claude-relay: workspace from roots={path}");
+                }
+            }
+        }
+
+        let response = handle_request(&conn, &request, &mut state);
         let response_str = serde_json::to_string(&response)?;
         writeln!(stdout, "{response_str}")?;
         stdout.flush()?;
@@ -34,7 +66,7 @@ pub fn serve() -> Result<()> {
     Ok(())
 }
 
-fn handle_request(conn: &rusqlite::Connection, request: &Value) -> Value {
+fn handle_request(conn: &rusqlite::Connection, request: &Value, state: &mut ServerState) -> Value {
     let method = request
         .get("method")
         .and_then(|m| m.as_str())
@@ -53,14 +85,11 @@ fn handle_request(conn: &rusqlite::Connection, request: &Value) -> Value {
                 },
                 "serverInfo": {
                     "name": "claude-relay",
-                    "version": "0.1.0"
+                    "version": "0.2.0"
                 }
             }
         }),
-        "notifications/initialized" => {
-            // 通知なので返答不要だが、念のため
-            return Value::Null;
-        }
+        "notifications/initialized" => Value::Null,
         "tools/list" => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -69,7 +98,7 @@ fn handle_request(conn: &rusqlite::Connection, request: &Value) -> Value {
             }
         }),
         "tools/call" => {
-            let result = handle_tool_call(conn, &params);
+            let result = handle_tool_call(conn, &params, state);
             match result {
                 Ok(content) => json!({
                     "jsonrpc": "2.0",
@@ -109,7 +138,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "memory_search",
-            "description": "Search session memory by keyword and date. Returns matching entries across all sessions.",
+            "description": "Search session memory by keyword and date. Results are scoped to the current workspace.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -159,33 +188,16 @@ fn tool_definitions() -> Value {
                 "required": ["session_id"]
             }
         },
-        {
-            "name": "memory_get_summary",
-            "description": "Get session summaries (handover notes).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Specific session (omit for recent)" },
-                    "limit": { "type": "number", "description": "Max results (default 5)" }
-                }
-            }
-        }
     ])
 }
 
-fn handle_tool_call(conn: &rusqlite::Connection, params: &Value) -> Result<String> {
-    let tool_name = params
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or(json!({}));
+fn handle_tool_call(conn: &rusqlite::Connection, params: &Value, state: &mut ServerState) -> Result<String> {
+    let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    // ツール呼び出し前にフォールバック同期
+    // ツール呼び出し前に同期
     if let Err(e) = ingest::sync_all(conn) {
-        eprintln!("Sync warning: {e}");
+        eprintln!("Sync error: {e}");
     }
 
     match tool_name {
@@ -198,25 +210,11 @@ fn handle_tool_call(conn: &rusqlite::Connection, params: &Value) -> Result<Strin
             let session_id = args.get("session_id").and_then(|s| s.as_str());
             let limit = args.get("limit").and_then(|l| l.as_i64()).unwrap_or(20);
 
-            let entries = db::search(conn, query, date, date_from, date_to, entry_type, session_id, limit)?;
-            let result: Vec<Value> = entries
-                .iter()
-                .map(|e| {
-                    json!({
-                        "id": e.id,
-                        "session_id": e.session_id,
-                        "timestamp": e.timestamp,
-                        "date": e.date,
-                        "time": e.time,
-                        "type": e.entry_type,
-                        "tool_name": e.tool_name,
-                        "content": e.content,
-                        "cwd": e.cwd,
-                        "git_branch": e.git_branch,
-                    })
-                })
-                .collect();
-            Ok(serde_json::to_string_pretty(&result)?)
+            let entries = db::search(
+                conn, query, date, date_from, date_to, entry_type, session_id, limit,
+                state.workspace.as_deref()
+            )?;
+            Ok(serde_json::to_string_pretty(&format_entries(&entries))?)
         }
         "memory_get_entry" => {
             let id = args.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
@@ -255,10 +253,7 @@ fn handle_tool_call(conn: &rusqlite::Connection, params: &Value) -> Result<Strin
             Ok(serde_json::to_string_pretty(&result)?)
         }
         "memory_get_session" => {
-            let session_id = args
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+            let session_id = args.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
             let entry_type = args.get("type").and_then(|t| t.as_str());
             let limit = args.get("limit").and_then(|l| l.as_i64()).unwrap_or(50);
             let entries = db::get_session_entries(conn, session_id, entry_type, limit)?;
@@ -277,38 +272,26 @@ fn handle_tool_call(conn: &rusqlite::Connection, params: &Value) -> Result<Strin
                 .collect();
             Ok(serde_json::to_string_pretty(&result)?)
         }
-        "memory_get_summary" => {
-            let session_id = args.get("session_id").and_then(|s| s.as_str());
-            let limit = args.get("limit").and_then(|l| l.as_i64()).unwrap_or(5);
-            let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-                if let Some(sid) = session_id {
-                    (
-                        "SELECT session_id, project_path, git_branch, started_at, ended_at, summary_md
-                         FROM summaries WHERE session_id = ?1 LIMIT ?2".to_string(),
-                        vec![Box::new(sid.to_string()), Box::new(limit)],
-                    )
-                } else {
-                    (
-                        "SELECT session_id, project_path, git_branch, started_at, ended_at, summary_md
-                         FROM summaries ORDER BY created_at DESC LIMIT ?1".to_string(),
-                        vec![Box::new(limit)],
-                    )
-                };
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_ref.as_slice(), |row| {
-                Ok(json!({
-                    "session_id": row.get::<_, String>(0)?,
-                    "project_path": row.get::<_, Option<String>>(1)?,
-                    "git_branch": row.get::<_, Option<String>>(2)?,
-                    "started_at": row.get::<_, Option<String>>(3)?,
-                    "ended_at": row.get::<_, Option<String>>(4)?,
-                    "summary_md": row.get::<_, String>(5)?,
-                }))
-            })?;
-            let result: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
-            Ok(serde_json::to_string_pretty(&result)?)
-        }
         _ => anyhow::bail!("Unknown tool: {tool_name}"),
     }
+}
+
+fn format_entries(entries: &[db::RawEntry]) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "session_id": e.session_id,
+                "timestamp": e.timestamp,
+                "date": e.date,
+                "time": e.time,
+                "type": e.entry_type,
+                "tool_name": e.tool_name,
+                "content": e.content,
+                "cwd": e.cwd,
+                "git_branch": e.git_branch,
+            })
+        })
+        .collect()
 }

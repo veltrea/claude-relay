@@ -29,7 +29,6 @@ pub fn init(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_raw_timestamp ON raw_entries(timestamp);
         CREATE INDEX IF NOT EXISTS idx_raw_date ON raw_entries(date);
         CREATE INDEX IF NOT EXISTS idx_raw_type ON raw_entries(type);
-
         CREATE VIRTUAL TABLE IF NOT EXISTS raw_entries_fts USING fts5(
             content, tool_name, session_id
         );
@@ -38,19 +37,9 @@ pub fn init(conn: &Connection) -> Result<()> {
             file_path TEXT PRIMARY KEY,
             last_offset INTEGER DEFAULT 0
         );
-
-        CREATE TABLE IF NOT EXISTS summaries (
-            id INTEGER PRIMARY KEY,
-            session_id TEXT NOT NULL UNIQUE,
-            project_path TEXT,
-            git_branch TEXT,
-            started_at TEXT,
-            ended_at TEXT,
-            summary_md TEXT NOT NULL,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
         ",
     )?;
+
     Ok(())
 }
 
@@ -60,7 +49,6 @@ pub fn reset(conn: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS raw_entries_fts;
         DROP TABLE IF EXISTS raw_entries;
         DROP TABLE IF EXISTS sync_state;
-        DROP TABLE IF EXISTS summaries;
         ",
     )?;
     init(conn)?;
@@ -96,7 +84,9 @@ pub fn insert_entry(
     conn.execute(
         "INSERT INTO raw_entries (session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![session_id, timestamp, date, time, entry_type, tool_name, content, cwd, git_branch],
+        params![
+            session_id, timestamp, date, time, entry_type, tool_name, content, cwd, git_branch
+        ],
     )?;
     let id = conn.last_insert_rowid();
 
@@ -145,9 +135,6 @@ pub fn stats(conn: &Connection) -> Result<String> {
     )?;
     let sync_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM sync_state", [], |row| row.get(0))?;
-    let summary_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))?;
-
     let min_date = date_range.0.unwrap_or_else(|| "(none)".to_string());
     let max_date = date_range.1.unwrap_or_else(|| "(none)".to_string());
 
@@ -155,12 +142,10 @@ pub fn stats(conn: &Connection) -> Result<String> {
         "Entries:    {entry_count}\n\
          Sessions:   {session_count}\n\
          Date range: {min_date} .. {max_date}\n\
-         Summaries:  {summary_count}\n\
          Tracked files: {sync_count}"
     ))
 }
 
-/// FTS 検索（クエリが空や "*" の場合は FTS を使わず直接検索）
 pub fn search(
     conn: &Connection,
     query: &str,
@@ -170,6 +155,7 @@ pub fn search(
     entry_type: Option<&str>,
     session_id: Option<&str>,
     limit: i64,
+    workspace: Option<&str>,
 ) -> Result<Vec<RawEntry>> {
     let trimmed = query.trim();
     let use_fts = !trimmed.is_empty() && trimmed != "*";
@@ -201,7 +187,6 @@ pub fn search(
         param_idx = 1;
     }
 
-    // FTS時は r. プレフィックス（JOINのエイリアス）、非FTS時はプレフィックスなし
     let col = |name: &str| -> String {
         if use_fts { format!("r.{name}") } else { name.to_string() }
     };
@@ -229,6 +214,11 @@ pub fn search(
     if let Some(s) = session_id {
         conditions.push(format!("{} = ?{param_idx}", col("session_id")));
         param_values.push(Box::new(s.to_string()));
+        param_idx += 1;
+    }
+    if let Some(ws) = workspace {
+        conditions.push(format!("{} LIKE ?{param_idx}", col("cwd")));
+        param_values.push(Box::new(format!("{ws}%")));
         param_idx += 1;
     }
 
@@ -264,7 +254,6 @@ pub fn search(
     Ok(entries)
 }
 
-/// エントリ全文取得
 pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
     let mut stmt = conn.prepare(
         "SELECT id, session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch
@@ -289,7 +278,6 @@ pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
     Ok(entry)
 }
 
-/// セッション一覧
 pub fn list_sessions(
     conn: &Connection,
     date: Option<&str>,
@@ -332,7 +320,6 @@ pub fn list_sessions(
     Ok(sessions)
 }
 
-/// 特定セッションのエントリ取得
 pub fn get_session_entries(
     conn: &Connection,
     session_id: &str,
