@@ -1,132 +1,131 @@
 # claude-relay ハンドオーバー文書
 
-**作成日:** 2026-03-29
-**バージョン:** v0.2.1
-**リポジトリ:** https://github.com/veltrea/claude-relay
+作成日: 2026-03-30（更新）
+
+---
+
+## セッション引き継ぎの注意
+
+このセッションは **`agents-relay` ワークスペース**で作業していたにもかかわらず、
+`claude-relay` のコードを診断・修正していた。
+ワークスペースの取り違えと、メモリスコーピングが効いていなかったことが原因。
+
+**次のセッションでは必ず `/Volumes/2TB_USB/dev/claude-relay/` を正しいワークスペースとして開くこと。**
+**`claude-relay serve --workspace /Volumes/2TB_USB/dev/claude-relay` でスコープを効かせること。**
 
 ---
 
 ## プロジェクト概要
 
-Claude CLI の会話ログ（JSONL）を SQLite に取り込み、MCP ツール経由で過去の会話を検索・参照できるようにするメモリ拡張ツール。Rust 製シングルバイナリ、外部依存なし。
+Claude Code のセッション記憶をSQLiteに蓄積し、MCPツール経由でAIが過去の会話を検索できるようにするツール。
 
-## 現在の状態
+- **バイナリ**: `target/release/claude-relay`
+- **DB**: `~/.claude-relay/memory.db`
+- **MCP起動**: `claude-relay serve --workspace <path>`
+- **GitHub**: https://github.com/veltrea/claude-relay
 
-| 項目 | 状態 |
+---
+
+## このセッションでやったこと
+
+### 1. GitHub Actionsの拡張（commit: `0fad0ad`）
+5プラットフォーム → 11プラットフォームに拡張。
+
+| OS | アーキテクチャ |
 |---|---|
-| コアパイプライン（ingest → DB → search） | ✅ 完成・テスト済み |
-| ワークスペーススコーピング | ✅ 実装済み |
-| クロスワークスペース検索（unlock_cross_scope） | ✅ 実装済み |
-| クライアント検出（Claude Code, Cursor等） | ✅ 実装済み |
-| GitHub Actions リリースワークフロー | ✅ macOS/Linux/Windows |
-| E2E リコールテスト | ✅ 30件 100% PASS |
-| レイヤー別テスト（L1〜L3） | ✅ スクリプト作成済み |
+| macOS | arm64, x86_64 |
+| Linux (musl static) | x86_64, arm64, armv7, i686 |
+| Windows (MSVC) | x86_64, arm64, i686 |
+| FreeBSD | x86_64 |
 
-## ソースコード構成
+### 2. バグ分析と修正（commit: `f239f84`, `7f371bb`）
 
-```
-src/
-├── main.rs      (433行) CLI エントリポイント、サブコマンド定義
-├── db.rs        (444行) SQLite 操作、マイグレーション、FTS5
-├── mcp.rs       (380行) MCP サーバー、ツール定義・ハンドラ
-├── ingest.rs    (316行) JSONL パーサー、差分取り込み
-├── detect.rs    (104行) クライアント検出（PPID, clientInfo）
-├── config.rs    (100行) 設定管理
-└── export.rs    ( 66行) セッションの Markdown エクスポート
-```
+全9件のバグを発見・修正・ドキュメント化した。詳細は `docs/bugs/` を参照。
 
-合計: 約1,843行
+| BUG | 重要度 | 内容 | 状態 |
+|---|---|---|---|
+| 001 | 🔴 Critical | クラッシュ時の重複挿入 | ✅ 修正済み |
+| 002 | 🔴 Critical | FTS/raw_entriesのトランザクション欠如 | ✅ 修正済み |
+| 003 | 🟠 Major | Windowsオフセットズレ（CRLF） | ✅ 修正済み |
+| 004 | 🟠 Major | Archiveコマンドのトランザクション欠如 | ✅ 修正済み |
+| 005 | 🟠 Major | workspaceフィルタのLIKE特殊文字 | ✅ 修正済み |
+| 006 | 🟡 Minor | detect.rsの"code"マッチが広すぎる | ✅ 修正済み |
+| 007 | 🟡 Minor | id引数のfloat非対応（MCP経由） | ✅ 修正済み |
+| 008 | 🟡 Minor | マルチバイト文字でパニック可能性 | ✅ 修正済み |
+| 009 | 🟡 Minor | NULL cwdがワークスペーススコープで除外 | ✅ 修正済み |
 
-## MCP ツール一覧
+修正はAntigravity（Sonnet 4.6）が `docs/bugs/` の指示書を読んで実施。
+Claude（このセッション）がコードレビューとビルド・テスト確認を担当。
 
-| ツール名 | 機能 |
-|---|---|
-| `memory_search` | キーワード/日付でセッション記憶を全文検索 |
-| `memory_get_entry` | ID 指定で記憶エントリの全文取得 |
-| `memory_list_sessions` | セッション一覧（タイムスタンプ、件数） |
-| `memory_get_session` | セッション内の会話フロー取得 |
-| `memory_unlock_cross_scope` | 他ワークスペースの記憶参照を許可（要ユーザー確認） |
+### 3. リグレッションテスト作成（commit: `4a3229c`）
 
-## 既知の注意点・ノウハウ
-
-### AI が渡すパラメータの型問題
-
-AIはJSONスキーマ通りの型を渡すとは限らない:
-
-```rust
-// integer → AI が float (3.0) で渡すことがある
-let limit = args.get("limit")
-    .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-    .unwrap_or(20) as usize;
-
-// boolean → AI が文字列 "true" で渡すことがある
-let confirmed = args.get("confirmed")
-    .map(|c| c.as_bool().unwrap_or_else(|| c.as_str() == Some("true")))
-    .unwrap_or(false);
-```
-
-### テスト方法
-
-JSON-RPC 流し込みテストだけでは不十分。**必ず AI 自身に実際にツールを呼ばせて動作確認する**こと。
-
-## テスト結果サマリ
-
-### ワンショットモード（`claude -p`）テスト
-
-- **方式:** `claude -p "Please acknowledge: RELAY_TEST_XXXX_..."` で30件のランダムフレーズを逐次送信
-- **目的:** Claude CLI → JSOL 記録 → ingest → DB → memory_search の全パイプライン検証
-- **結果:** 30/30 = **100% recall** (3.5分で完了)
-- **ポイント:** `< /dev/null` で stdin 競合を回避する必要あり
-
-### インタラクティブモードテスト
-
-- **方式:** tmux で Claude を対話的に起動し、フレーズを送信後 `/exit` で終了
-- **目的:** ワンショットではなく実際の対話セッションで JSOL が正しく記録されるか検証
-- **結果:** 30/30 = **100% recall**
-- **ポイント:** 起動に10秒以上かかるため、ワンショットより時間がかかる
-
-### テストの統計的根拠
-
-- 30件は中心極限定理の最低ライン
-- ソフトウェアテストでは「全部通るか全部落ちるか」になりやすいため、30件で十分な信頼性
-- 95%信頼区間で recall rate ±18% の精度
-
-## 後継プロジェクト: agents-relay
-
-`/Volumes/2TB_USB/dev/agents-relay` にマルチエージェント対応版を開発中。claude-relay のコアロジックをベースに拡張。
-
-## セットアップ手順
+`tests/bug_regression_test.sh` — BUG-001〜009の修正を自動検証するスクリプト。
 
 ```bash
-# ビルド
-cargo build --release
-
-# Claude Code の settings.json に追加
-# mcpServers → claude-relay → command: "/path/to/claude-relay", args: ["serve"]
-
-# 手動 ingest
-claude-relay ingest ~/.claude/projects
-
-# CLI で検索テスト
-claude-relay tool memory_search --query "キーワード"
+bash tests/bug_regression_test.sh
+# → 18 PASS, 0 FAIL, 1 SKIP (BUG-007はMCP経由のみ)
 ```
 
-## ファイル一覧（リポジトリ）
+- テスト用DBを `HOME` 上書きで本番から完全隔離
+- BUG-007のみSKIP（CLIでは再現不可、Claudeに実際に呼ばせて確認が必要）
+
+---
+
+## 残タスク
+
+### 優先度高
+
+- [ ] **バージョンタグを打つ** — 全バグ修正済みのため `v0.3.0` リリース推奨
+  ```bash
+  git tag v0.3.0 && git push origin v0.3.0
+  ```
+  → GitHub Actionsが11プラットフォーム向けバイナリをビルドしてリリースに添付する
+
+- [ ] **BUG-007の実機テスト** — Claudeに `memory_get_entry` をid=整数で呼ばせて、
+  floatで渡されても正しく動作することを確認する
+
+### 優先度中
+
+- [ ] **ワークスペーススコープを有効にして運用する**
+  スコープなしだと全ワークスペースの記憶が混線する（今回実際に体験した問題）。
+
+- [ ] **agents-relayへの機能マージ検討** — agents-relayはclaude-relayの後継。
+  今回の修正（BUG-001〜009）をagents-relay側にも適用すべきか検討する。
+
+---
+
+## ビルド・テスト手順
+
+```bash
+cd /Volumes/2TB_USB/dev/claude-relay
+
+export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+cargo build --release   # ビルド
+cargo test              # 単体テスト
+bash tests/bug_regression_test.sh  # リグレッションテスト（全BUG検証）
+```
+
+---
+
+## ファイル構成
 
 ```
-├── Cargo.toml           パッケージ定義
-├── src/                 Rust ソースコード
+claude-relay/
+├── src/
+│   ├── main.rs       # CLIエントリポイント
+│   ├── db.rs         # SQLite操作（FTS5, search, ingest）
+│   ├── ingest.rs     # JSOLファイル取り込み（バッチトランザクション）
+│   ├── mcp.rs        # MCPサーバー（memory_search等のツール定義）
+│   ├── detect.rs     # クライアント検出（PPID/clientInfo）
+│   ├── config.rs     # 設定管理
+│   └── export.rs     # Markdownエクスポート
 ├── docs/
-│   ├── ARCHITECTURE.md  アーキテクチャ詳細
-│   └── blog_testing_strategy.md
+│   ├── bugs/         # BUG-001〜009の詳細ドキュメント（全修正済み）
+│   └── antigravity_compatibility.md
 ├── tests/
-│   ├── memory_recall_test.sh     ワンショット E2E テスト
-│   ├── memory_recall_test_v2.sh  インタラクティブ E2E テスト
-│   ├── seed_worker.sh            seed ワーカー（並列版用）
-│   ├── test_layer1_jsol.sh       レイヤー1 単体テスト
-│   ├── test_layer2_ingest.sh     レイヤー2 単体テスト
-│   ├── test_layer3_search.sh     レイヤー3 単体テスト
-│   └── TEST_REPORT.md            テスト設計書・結果レポート
-├── HANDOVER.md          ← この文書
-└── .github/workflows/   CI/CD リリースワークフロー
+│   ├── bug_regression_test.sh   # バグリグレッションテスト
+│   └── memory_recall_test.sh    # E2Eリコールテスト（claude -p経由）
+├── .github/workflows/release.yml  # 11プラットフォームCI/CD
+├── changelog.md
+└── HANDOVER.md  ← このファイル
 ```
