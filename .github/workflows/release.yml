@@ -12,23 +12,49 @@ jobs:
     permissions:
       contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # macOS
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: claude-relay-macos-arm64
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: claude-relay-macos-x86_64
+
+          # Linux (musl = static binary, glibc不要)
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact: claude-relay-linux-x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             artifact: claude-relay-linux-arm64
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            artifact: claude-relay-linux-armv7
+            cross: true
+          - target: i686-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: claude-relay-linux-i686
+            cross: true
+
+          # Windows
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: claude-relay-windows-x86_64.exe
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            artifact: claude-relay-windows-arm64.exe
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            artifact: claude-relay-windows-i686.exe
+
+          # FreeBSD (cross-compile)
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            artifact: claude-relay-freebsd-x86_64
+            cross: true
 
     steps:
       - uses: actions/checkout@v4
@@ -38,12 +64,21 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl tools (Linux)
-        if: contains(matrix.target, 'linux-musl')
+      - name: Install musl tools (Linux native)
+        if: contains(matrix.target, 'linux-musl') && !matrix.cross
         run: sudo apt-get install -y musl-tools
 
-      - name: Build
+      - name: Install cross (cross-compile targets)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: "!matrix.cross"
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Copy binary (Unix)
         if: runner.os != 'Windows'
