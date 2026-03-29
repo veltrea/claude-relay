@@ -5,10 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
-- Fix SQL LIKE injection by escaping `%` and `_` in `workspace` parameter to ensure accurate filtering (BUG-005)
-- Refine VS Code client detection to avoid misidentifying unrelated processes like `recode` or `node` (BUG-006)
-- Handle `id` arguments passed as float in `memory_get_entry` to prevent missing entries (BUG-007)
-- Fix multibyte string slicing panic: replaced byte-based truncation with safe character boundary slicing to prevent `byte index is not a char boundary` errors during `memory_search` (BUG-008)
+- **BUG-001/002**: Introduce batch transaction architecture in `ingest_file` — inserts to `raw_entries` and `raw_entries_fts` are now committed atomically every 100 entries together with the sync offset, preventing duplicate entries on crash recovery and eliminating FTS/raw_entries desync
+- **BUG-003**: Fix byte offset drift on Windows CRLF files — replaced `lines()` iterator (which strips `\r`) with `read_line()` to count exact bytes read, ensuring accurate incremental sync across platforms
+- **BUG-004**: Wrap archive DELETE in a transaction and add `file.exists()` idempotency check — prevents data loss if process is killed between file write and DB delete; also wraps `write` command insert in a transaction
+- **BUG-005**: Fix SQL LIKE injection by escaping `%`, `_` and `\` in `workspace` parameter in both `search` and `list_sessions` functions
+- **BUG-006**: Refine VS Code client detection — replaced broad `contains("code")` with exact match `n == "code"` and prefix checks; added unit tests for false-positive cases (`recode`, `xcode`, `node`, `electron`)
+- **BUG-007**: Handle `id` arguments passed as float in `memory_get_entry` — applies same `as_i64().or_else(as_f64())` pattern already used for `limit`
+- **BUG-008**: Fix multibyte string slicing panic in `memory_search` CLI output — replaced byte-based `[..120]` slice with `chars().take(60).collect()`
+- **BUG-009**: Include `cwd IS NULL` entries in workspace-scoped search — `NULL LIKE x` evaluates to NULL in SQL, silently excluding entries without a recorded cwd; fixed in both `search` and `list_sessions`
 
 ## [0.2.1] - 2026-03-27
 
@@ -17,7 +21,6 @@ All notable changes to this project will be documented in this file.
 - Fix `memory_unlock_cross_scope`: accept `confirmed` as both JSON boolean and string `"true"`
 - Fix `db::init`: create `client` index after migration to avoid column-not-found error
 - Remove emoji characters from MCP response messages
-- Fix workspace scoping: entries with `cwd IS NULL` were silently excluded from workspace-scoped searches due to SQL `NULL LIKE x = NULL` semantics (BUG-009); now included via `OR cwd IS NULL`
 
 ## [0.2.0] - 2026-03-27
 

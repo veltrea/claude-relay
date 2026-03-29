@@ -19,10 +19,10 @@ struct ServerState {
 /// MCP stdio サーバーを起動
 pub fn serve(workspace: Option<String>) -> Result<()> {
     let db_path = Config::db_path();
-    let conn = db::open(&db_path)?;
+    let mut conn = db::open(&db_path)?;
     db::init(&conn)?;
 
-    if let Err(e) = ingest::sync_all(&conn) {
+    if let Err(e) = ingest::sync_all(&mut conn) {
         eprintln!("claude-relay: startup sync error: {e}");
     }
 
@@ -83,7 +83,7 @@ pub fn serve(workspace: Option<String>) -> Result<()> {
             }
         }
 
-        let response = handle_request(&conn, &request, &mut state);
+        let response = handle_request(&mut conn, &request, &mut state);
         if response.is_null() {
             continue;
         }
@@ -95,7 +95,7 @@ pub fn serve(workspace: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(conn: &rusqlite::Connection, request: &Value, state: &mut ServerState) -> Value {
+fn handle_request(conn: &mut rusqlite::Connection, request: &Value, state: &mut ServerState) -> Value {
     let method = request
         .get("method")
         .and_then(|m| m.as_str())
@@ -243,7 +243,7 @@ fn tool_definitions() -> Value {
     ])
 }
 
-fn handle_tool_call(conn: &rusqlite::Connection, params: &Value, state: &mut ServerState) -> Result<String> {
+fn handle_tool_call(conn: &mut rusqlite::Connection, params: &Value, state: &mut ServerState) -> Result<String> {
     let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 

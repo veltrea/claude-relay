@@ -158,7 +158,7 @@ enum SyncAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = config::Config::db_path();
-    let conn = db::open(&db_path)?;
+    let mut conn = db::open(&db_path)?;
     db::init(&conn)?;
 
     match cli.command {
@@ -186,13 +186,16 @@ fn main() -> Result<()> {
                 - chrono::Duration::days(cfg.retention_days as i64);
             let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
 
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT date FROM raw_entries WHERE date < ?1 ORDER BY date",
-            )?;
-            let dates: Vec<String> = stmt
-                .query_map(rusqlite::params![cutoff_date], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+            let dates: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT date FROM raw_entries WHERE date < ?1 ORDER BY date",
+                )?;
+                let res: Vec<String> = stmt
+                    .query_map(rusqlite::params![cutoff_date], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                res
+            };
 
             if dates.is_empty() {
                 println!("No entries older than {cutoff_date} to archive.");
@@ -214,11 +217,18 @@ fn main() -> Result<()> {
                 } else {
                     let md = export::export_date(&conn, date)?;
                     std::fs::create_dir_all(&dir)?;
-                    std::fs::write(&file, &md)?;
-                    conn.execute(
+
+                    if !file.exists() {
+                        std::fs::write(&file, &md)?;
+                    }
+
+                    let tx = conn.transaction()?;
+                    tx.execute(
                         "DELETE FROM raw_entries WHERE date = ?1",
                         rusqlite::params![date],
                     )?;
+                    tx.commit()?;
+
                     println!("Archived {date} -> {}", file.display());
                 }
             }
@@ -312,17 +322,19 @@ fn main() -> Result<()> {
             let ts = now.to_rfc3339();
             let date = now.format("%Y-%m-%d").to_string();
             let time = now.format("%H:%M:%S").to_string();
+            let tx = conn.transaction()?;
             let id = db::insert_entry(
-                &conn, &session, &ts, &date, &time, &r#type, None, &content, None, None, "claude-code",
+                &tx, &session, &ts, &date, &time, &r#type, None, &content, None, None, "claude-code",
             )?;
+            tx.commit()?;
             println!("Inserted entry id={id} type={} session={session}", r#type);
         }
 
         Commands::Ingest { path } => {
             let count = if path.is_dir() {
-                ingest::ingest_dir(&conn, &path)?
+                ingest::ingest_dir(&mut conn, &path)?
             } else {
-                ingest::ingest_file(&conn, &path)?
+                ingest::ingest_file(&mut conn, &path)?
             };
             println!("Ingested {count} entries.");
         }
@@ -369,7 +381,7 @@ fn main() -> Result<()> {
             id,
             limit,
         } => {
-            let sync_count = ingest::sync_all(&conn)?;
+            let sync_count = ingest::sync_all(&mut conn)?;
             if sync_count > 0 {
                 eprintln!("Synced {sync_count} entries before tool call.");
             }

@@ -11,7 +11,7 @@ use crate::db;
 const MAX_CONTENT_SIZE: usize = 50_000;
 
 /// JSONL ファイルを差分取り込み
-pub fn ingest_file(conn: &Connection, path: &Path) -> Result<u64> {
+pub fn ingest_file(conn: &mut Connection, path: &Path) -> Result<u64> {
     let path_str = path.to_string_lossy().to_string();
     let offset = db::get_sync_offset(conn, &path_str)?;
 
@@ -35,12 +35,19 @@ pub fn ingest_file(conn: &Connection, path: &Path) -> Result<u64> {
         .unwrap_or("unknown")
         .to_string();
 
-    for line in reader.lines() {
-        let line = line?;
-        let line_bytes = line.len() as i64 + 1; // +1 for newline
-        current_offset += line_bytes;
+    let mut line_buf = String::new();
+    let mut tx = conn.transaction()?;
 
-        let line = line.trim();
+    loop {
+        line_buf.clear();
+        let bytes_read = reader.read_line(&mut line_buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        current_offset += bytes_read as i64;
+
+        let line = line_buf.trim();
         if line.is_empty() {
             continue;
         }
@@ -52,7 +59,7 @@ pub fn ingest_file(conn: &Connection, path: &Path) -> Result<u64> {
 
         if let Some(n) = process_entry(&v, &file_session_id) {
             db::insert_entry(
-                conn,
+                &tx,
                 &n.session_id,
                 &n.timestamp,
                 &n.date,
@@ -65,15 +72,25 @@ pub fn ingest_file(conn: &Connection, path: &Path) -> Result<u64> {
                 "claude-code",
             )?;
             count += 1;
+
+            if count % 100 == 0 {
+                // オフセット更新も同じトランザクション内で行う
+                db::set_sync_offset(&tx, &path_str, current_offset)?;
+                tx.commit()?;
+                tx = conn.transaction()?; // 新しいトランザクションを開始
+            }
         }
     }
 
-    db::set_sync_offset(conn, &path_str, current_offset)?;
+    // 残りのトランザクションをコミット
+    db::set_sync_offset(&tx, &path_str, current_offset)?;
+    tx.commit()?;
+
     Ok(count)
 }
 
 /// ディレクトリ配下の JSONL を全部取り込み
-pub fn ingest_dir(conn: &Connection, dir: &Path) -> Result<u64> {
+pub fn ingest_dir(conn: &mut Connection, dir: &Path) -> Result<u64> {
     let pattern = format!("{}/**/*.jsonl", dir.to_string_lossy());
     let mut total = 0u64;
     for entry in glob::glob(&pattern)? {
@@ -88,7 +105,7 @@ pub fn ingest_dir(conn: &Connection, dir: &Path) -> Result<u64> {
 }
 
 /// Claude Code の全プロジェクトを取り込み
-pub fn sync_all(conn: &Connection) -> Result<u64> {
+pub fn sync_all(conn: &mut Connection) -> Result<u64> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
     let projects_dir = home.join(".claude").join("projects");
     if !projects_dir.exists() {
