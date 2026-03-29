@@ -389,7 +389,7 @@ fn main() -> Result<()> {
                         None, // workspace
                     )?;
                     for e in &entries {
-                        let preview = &e.content[..e.content.len().min(120)];
+                        let preview: String = e.content.chars().take(60).collect();
                         println!("[{}] {} | {} | {}: {}", e.id, e.date, e.time, e.entry_type, preview);
                     }
                     println!("\n{} results.", entries.len());

@@ -274,7 +274,9 @@ fn handle_tool_call(conn: &rusqlite::Connection, params: &Value, state: &mut Ser
             Ok(serde_json::to_string_pretty(&format_entries(&entries))?)
         }
         "memory_get_entry" => {
-            let id = args.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
+            let id = args.get("id")
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+                .unwrap_or(0);
             match db::get_entry(conn, id)? {
                 Some(e) => Ok(serde_json::to_string_pretty(&json!({
                     "id": e.id,

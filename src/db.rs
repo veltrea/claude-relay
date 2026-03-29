@@ -264,8 +264,14 @@ pub fn search(
         param_idx += 1;
     }
     if let Some(ws) = workspace {
-        conditions.push(format!("{} LIKE ?{param_idx}", col("cwd")));
-        param_values.push(Box::new(format!("{ws}%")));
+        let escaped = ws.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        // cwd IS NULL のエントリも含める（BUG-009修正）
+        // NULL LIKE anything は SQL では NULL（偽）になるため、明示的に OR cwd IS NULL を追加
+        let cwd_col = col("cwd");
+        conditions.push(format!(
+            "({cwd_col} LIKE ?{param_idx} ESCAPE '\\' OR {cwd_col} IS NULL)"
+        ));
+        param_values.push(Box::new(format!("{escaped}%")));
         param_idx += 1;
     }
 
@@ -343,8 +349,10 @@ pub fn list_sessions(
         idx += 1;
     }
     if let Some(ws) = workspace {
-        conditions.push(format!("cwd LIKE ?{idx}"));
-        params_vec.push(Box::new(format!("{ws}%")));
+        let escaped = ws.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        // cwd IS NULL のエントリも含める（BUG-009修正）
+        conditions.push(format!("(cwd LIKE ?{idx} ESCAPE '\\' OR cwd IS NULL)"));
+        params_vec.push(Box::new(format!("{escaped}%")));
         idx += 1;
     }
 

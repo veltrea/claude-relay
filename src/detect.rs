@@ -81,7 +81,7 @@ fn normalize_client(process_name: &str) -> &'static str {
         "cursor"
     } else if n.contains("windsurf") {
         "windsurf"
-    } else if n.contains("code") || n.contains("vscode") {
+    } else if n == "code" || n.starts_with("code ") || n.starts_with("code-server") || n.contains("vscode") || n == "codium" {
         "vscode"
     } else if n.contains("zed") {
         "zed"
@@ -101,4 +101,30 @@ pub fn detect_from_ppid() -> String {
 /// MCP initialize の clientInfo.name からクライアント名を正規化する
 pub fn normalize_client_info(client_info_name: &str) -> String {
     normalize_client(client_info_name).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_client() {
+        assert_eq!(normalize_client("code"), "vscode");
+        assert_eq!(normalize_client("code --version"), "vscode");
+        assert_eq!(normalize_client("vscode"), "vscode");
+        assert_eq!(normalize_client("codium"), "vscode");
+        assert_eq!(normalize_client("code-server"), "vscode");
+
+        // 誤検知しないことの確認
+        assert_eq!(normalize_client("recode"), "unknown");
+        assert_eq!(normalize_client("node"), "unknown");
+        assert_eq!(normalize_client("electron"), "unknown");
+        assert_eq!(normalize_client("xcode"), "unknown");
+
+        // 既存の他のクライアント
+        assert_eq!(normalize_client("claude"), "claude-code");
+        assert_eq!(normalize_client("cursor"), "cursor");
+        assert_eq!(normalize_client("windsurf"), "windsurf");
+        assert_eq!(normalize_client("zed"), "zed");
+    }
 }

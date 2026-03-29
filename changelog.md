@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Fix SQL LIKE injection by escaping `%` and `_` in `workspace` parameter to ensure accurate filtering (BUG-005)
+- Refine VS Code client detection to avoid misidentifying unrelated processes like `recode` or `node` (BUG-006)
+- Handle `id` arguments passed as float in `memory_get_entry` to prevent missing entries (BUG-007)
+- Fix multibyte string slicing panic: replaced byte-based truncation with safe character boundary slicing to prevent `byte index is not a char boundary` errors during `memory_search` (BUG-008)
+
 ## [0.2.1] - 2026-03-27
 
 ### Fixed
@@ -9,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - Fix `memory_unlock_cross_scope`: accept `confirmed` as both JSON boolean and string `"true"`
 - Fix `db::init`: create `client` index after migration to avoid column-not-found error
 - Remove emoji characters from MCP response messages
+- Fix workspace scoping: entries with `cwd IS NULL` were silently excluded from workspace-scoped searches due to SQL `NULL LIKE x = NULL` semantics (BUG-009); now included via `OR cwd IS NULL`
 
 ## [0.2.0] - 2026-03-27
 
