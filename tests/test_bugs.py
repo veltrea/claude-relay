@@ -134,7 +134,14 @@ class RelayTestCase(unittest.TestCase):
 # ── BUG-001: クラッシュ時の重複挿入防止 ──────────────────────────────
 
 class TestBug001_DuplicateIngest(RelayTestCase):
-    """同じファイルを複数回 ingest しても重複しないことを検証"""
+    """同じファイルを複数回 ingest しても重複しないことを検証
+
+    【旧挙動】ingest中にプロセスがクラッシュ(kill)すると、sync_state の
+    last_offset が更新されないまま raw_entries には一部が書き込まれた状態に
+    なる。再起動後の ingest が前回の途中から再開するため、既に書き込み済みの
+    行が再度INSERTされて重複が発生していた。
+    【修正】INSERT時に (session_id, timestamp, content) の複合UNIQUEで
+    重複を弾き、sync_offset の更新をトランザクション内で行うようにした。"""
 
     def test_double_ingest_no_duplicates(self):
         """基本: 同じファイルを2回ingestして重複ゼロ"""
@@ -217,7 +224,15 @@ class TestBug001_DuplicateIngest(RelayTestCase):
 # ── BUG-002: FTS/raw_entries トランザクション一致 ─────────────────────
 
 class TestBug002_FTSConsistency(RelayTestCase):
-    """raw_entries と raw_entries_fts が常に同期していることを検証"""
+    """raw_entries と raw_entries_fts が常に同期していることを検証
+
+    【旧挙動】raw_entries への INSERT と raw_entries_fts への INSERT が
+    別々のSQL文で実行されていたため、途中で失敗すると raw_entries には
+    行があるのに FTS にはない（または逆）という不整合が発生した。
+    memory_search が FTS 経由で検索するため、FTS に欠損があると
+    存在するエントリが検索にヒットしないという症状になっていた。
+    【修正】raw_entries INSERT と FTS INSERT を同一トランザクション内で
+    実行するようにした。"""
 
     def test_count_match(self):
         """件数が一致"""
@@ -257,7 +272,16 @@ class TestBug002_FTSConsistency(RelayTestCase):
 # ── BUG-003: CRLF 改行ファイルのオフセット ───────────────────────────
 
 class TestBug003_CRLFOffset(RelayTestCase):
-    """CRLF改行でオフセットがずれないことを検証"""
+    """CRLF改行でオフセットがずれないことを検証
+
+    【旧挙動】BufReader::read_line() は CRLF の \\r\\n を \\n に正規化して
+    返すが、sync_offset の計算に line.len() （正規化後のバイト数）を
+    使っていたため、1行ごとに1バイトずつオフセットがずれていた。
+    結果、2回目の ingest 時に「前回の続き」の位置が実際より手前になり、
+    JSON行の途中から読み始めてパースエラーか重複挿入が発生していた。
+    Windows環境（CRLF）やgitのautocrlf=true設定で顕在化する。
+    【修正】read_line() ではなくバイト単位で読み、\\r\\n を検出して
+    正しいバイト数で offset を計算するようにした。"""
 
     def test_crlf_offset_accurate(self):
         """CRLF ファイルの sync_offset がファイルサイズと一致"""
@@ -328,7 +352,16 @@ class TestBug003_CRLFOffset(RelayTestCase):
 # ── BUG-004: Archive 冪等性 ──────────────────────────────────────────
 
 class TestBug004_ArchiveIdempotency(RelayTestCase):
-    """Archive を複数回実行しても壊れないことを検証"""
+    """Archive を複数回実行しても壊れないことを検証
+
+    【旧挙動】archive コマンドは「DBからSELECT → MDファイルに書き出し →
+    DBからDELETE」の3ステップだったが、トランザクションで囲まれていなかった。
+    MDファイル書き出し後・DELETE前にクラッシュすると、次回のarchiveで
+    同じエントリが再度MDに追記されて内容が重複した。
+    また、2回目のarchive（対象0件）でも空のMDファイルを生成して
+    既存ファイルを上書きする可能性があった。
+    【修正】SELECT→書き出し→DELETE を1トランザクションで囲み、
+    対象0件の場合は何もしないようにした。"""
 
     def _setup_archive_entry(self, session, date):
         """古い日付のエントリを作成"""
@@ -389,7 +422,16 @@ class TestBug004_ArchiveIdempotency(RelayTestCase):
 # ── BUG-005: LIKE ワイルドカードインジェクション ──────────────────────
 
 class TestBug005_LIKEInjection(RelayTestCase):
-    """workspace の _ や % が LIKE ワイルドカードとして解釈されない"""
+    """workspace の _ や % が LIKE ワイルドカードとして解釈されない
+
+    【旧挙動】workspace フィルタで cwd LIKE '{workspace}%' を使っていたが、
+    workspace パス自体に含まれる _ や % をエスケープしていなかった。
+    SQLの LIKE では _ は「任意の1文字」、% は「任意の0文字以上」を意味するため、
+    例えば workspace=/test/proj_a で検索すると /test/projXa もヒットしていた。
+    パス名にアンダースコアを含むプロジェクト（my_project等）で他プロジェクトの
+    データが混入する問題。
+    【修正】workspace 文字列中の \\, %, _ を ESCAPE '\\' でエスケープしてから
+    LIKE に渡すようにした。"""
 
     def _insert_with_cwd(self, session, cwd, content="test"):
         self.run_relay("write", content, "--type", "user", "--session", session)
@@ -446,7 +488,15 @@ class TestBug005_LIKEInjection(RelayTestCase):
 # ── BUG-006: detect.rs 誤判定 ────────────────────────────────────────
 
 class TestBug006_DetectClient(RelayTestCase):
-    """cargo test で detect.rs のユニットテストを実行"""
+    """cargo test で detect.rs のユニットテストを実行
+
+    【旧挙動】detect_from_ppid() が親プロセス名からクライアントを判定する際、
+    normalize_client() のマッチングが不完全で、"claude" を含むが Claude Code
+    ではないプロセス名（例: "claude-relay" 自身）を誤って "claude-code" と
+    判定していた。また、未知のクライアント名を "unknown" ではなく空文字列で
+    返すケースがあり、DB の client カラムが空になっていた。
+    【修正】normalize_client() のパターンマッチを厳密化し、既知クライアント
+    以外は "unknown" を返すようにした。"""
 
     def test_cargo_test_detect(self):
         """cargo test detect::tests が通る"""
@@ -468,7 +518,16 @@ class TestBug006_DetectClient(RelayTestCase):
 # ── BUG-007: MCP で id が float で渡される問題 ───────────────────────
 
 class TestBug007_FloatID(RelayTestCase):
-    """MCP JSON-RPC で id=3.0（float）を渡しても正しく動く"""
+    """MCP JSON-RPC で id=3.0（float）を渡しても正しく動く
+
+    【旧挙動】MCP の tools/call ハンドラで引数の id や limit を
+    as_i64() のみで取得していた。しかし Claude 等の AI クライアントは
+    JSON の数値を float で送ることがあり（例: id=3 → 3.0）、
+    serde_json は 3.0 を Number::Float として保持するため as_i64() が
+    None を返し、デフォルト値（id=0, limit=20）にフォールバックしていた。
+    結果、指定した id のエントリが取得できない、limit が無視される等の問題。
+    【修正】as_i64() に加えて as_f64().map(|f| f as i64) でもパースし、
+    さらに文字列 "3" のケースも as_str().and_then(parse) で対応した。"""
 
     def test_memory_get_entry_with_float_id(self):
         """memory_get_entry に float id を渡す"""
@@ -522,7 +581,16 @@ class TestBug007_FloatID(RelayTestCase):
 # ── BUG-008: マルチバイト文字でパニック ───────────────────────────────
 
 class TestBug008_MultibytePanic(RelayTestCase):
-    """マルチバイト文字で文字列切り詰め時にパニックしない"""
+    """マルチバイト文字で文字列切り詰め時にパニックしない
+
+    【旧挙動】検索結果のプレビュー表示で content を固定バイト数（例: 120バイト）で
+    切り詰めていたが、&content[..120] のようにバイトインデックスで直接スライス
+    していた。UTF-8 のマルチバイト文字（日本語=3バイト、絵文字=4バイト）の
+    途中でスライスすると、Rust は不正な文字境界として panic する。
+    日本語やEmoji を含むエントリを memory_search するだけでプロセスが
+    クラッシュしていた。
+    【修正】char_indices() で文字境界を走査し、バイト数が上限を超えない
+    最後の文字境界で切り詰めるようにした。"""
 
     def test_japanese_long_text(self):
         """日本語60文字超でsearchしてもパニックしない"""
@@ -566,7 +634,15 @@ class TestBug008_MultibytePanic(RelayTestCase):
 # ── BUG-009: NULL cwd がワークスペース検索で除外される ────────────────
 
 class TestBug009_NullCwd(RelayTestCase):
-    """cwd=NULL のエントリがワークスペーススコープに含まれる"""
+    """cwd=NULL のエントリがワークスペーススコープに含まれる
+
+    【旧挙動】workspace スコープの WHERE 句が cwd LIKE '{ws}%' のみだった。
+    SQL では NULL LIKE 'anything' の結果は NULL（偽扱い）になるため、
+    cwd が NULL のエントリはどのワークスペースで検索しても絶対にヒットしなかった。
+    CLIの write コマンドや、cwd を送ってこないクライアントから登録された
+    エントリが検索結果から完全に消えていた。
+    【修正】WHERE 句を (cwd LIKE ? ESCAPE '\\' OR cwd IS NULL) に変更し、
+    cwd 未設定のエントリもワークスペース検索に含まれるようにした。"""
 
     def test_null_cwd_included_in_search(self):
         """NULL cwd が OR cwd IS NULL で取得できる"""
